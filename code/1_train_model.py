@@ -79,9 +79,6 @@ def main():
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--threshold-percentile", type=float, default=99.99)
-    parser.add_argument("--train-weeks", type=int, default=6)
-    parser.add_argument("--val-weeks", type=int, default=2)
-    parser.add_argument("--threshold-weeks", type=int, default=2)
     parser.add_argument("--use-synthetic-anomalies", action="store_true",
                         help="Calibrate the threshold against synthetic anomalies instead of the 99.99th percentile of normal validation scores.")
     parser.add_argument("--synthetic-anomaly-types", type=str, nargs="+", default=["point", "level_shift"])

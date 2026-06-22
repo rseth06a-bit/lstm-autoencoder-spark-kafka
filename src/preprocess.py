@@ -40,8 +40,6 @@ class TimeSeriesDataset(Dataset):
 
     def __init__(self, sequences: np.ndarray):
         self.sequences = torch.FloatTensor(sequences)
-        if self.sequences.ndim == 2:
-            self.sequences = self.sequences.unsqueeze(-1)
 
     def __len__(self) -> int:
         return len(self.sequences)
