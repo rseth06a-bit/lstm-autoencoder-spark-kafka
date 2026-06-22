@@ -44,7 +44,6 @@ from src.preprocess import (
     PreprocessorConfig,
     TimeSeriesDataset,
     preprocess_pipeline,
-    get_test_week_info,
 )
 from src.synthetic import SyntheticAnomalyConfig, generate_synthetic_dataset
 from src.training import TrainingConfig, save_training_artifacts, train_model
@@ -70,9 +69,8 @@ def load_model(model_path: str, device: torch.device) -> EncDecAD:
 
 def main():
     parser = argparse.ArgumentParser(description="Train LSTM Encoder-Decoder for Anomaly Detection")
-    parser.add_argument("--data-path", type=str, default=str(PROJECT_ROOT / "data" / "nyc_taxi.csv"))
-    parser.add_argument("--output-dir", type=str, default=str(PROJECT_ROOT / "models" / "initial"),
-                        help="Where to save your trained artifacts. Defaults to models/initial/ to leave the prebuilt models/lstm_model.pt et al untouched.")
+    parser.add_argument("--data-dir", type=str, default=str(PROJECT_ROOT / "set-a"))
+    parser.add_argument("--output-dir", type=str, default=str(PROJECT_ROOT / "models" / "initial"), help="Where to save your trained artifacts. Defaults to models/initial/ to leave the prebuilt models/lstm_model.pt et al untouched.")
     parser.add_argument("--hidden-dim", type=int, default=24)
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -123,18 +121,15 @@ def main():
 
     # Step 1: Preprocess data
     print("\n--- Step 1: Preprocessing data ---")
-    preprocess_config = PreprocessorConfig(
-        train_weeks=args.train_weeks,
-        val_weeks=args.val_weeks,
-        threshold_weeks=args.threshold_weeks,
-    )
-    dataloaders, normalized_splits, scaler, week_info, split_indices = preprocess_pipeline(
-        args.data_path, config=preprocess_config, batch_size=args.batch_size
+    preprocess_config = PreprocessorConfig()
+    dataloaders, normalized_splits, scaler, patient_ids, split_ids = preprocess_pipeline(
+        args.data_dir, config=preprocess_config, batch_size=args.batch_size
     )
 
     # Step 2: Create model
     print("\n--- Step 2: Creating model ---")
     model = create_model(
+        input_dim=5,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -161,7 +156,7 @@ def main():
     print("\n--- Step 4: Fitting anomaly scorer (window-level Mahalanobis) ---")
     scorer_config = ScorerConfig(
         threshold_percentile=args.threshold_percentile,
-        scoring_mode="window",
+        scoring_mode="point",
     )
     scorer = AnomalyScorer(config=scorer_config)
     scorer.fit(model, dataloaders["val"], device)
@@ -180,8 +175,7 @@ def main():
         )
         synthetic_dataset = TimeSeriesDataset(synthetic_weeks)
         synthetic_loader = DataLoader(synthetic_dataset, batch_size=args.batch_size, shuffle=False)
-
-        normal_scores, _ = scorer.compute_scores(model, dataloaders["threshold_val"], device)
+        normal_scores, _ = scorer.compute_scores(model, dataloaders["val"], device)
         synth_scores, _ = scorer.compute_scores(model, synthetic_loader, device)
         if args.threshold_calibration_method != "percentile":
             opt_t, _ = scorer.find_optimal_threshold(
@@ -191,36 +185,15 @@ def main():
         else:
             scorer.set_threshold(normal_scores)
     else:
-        val_scores, _ = scorer.compute_scores(model, dataloaders["threshold_val"], device)
+        val_scores, _ = scorer.compute_scores(model, dataloaders["val"], device)
         scorer.set_threshold(val_scores)
 
     # Step 5: Quick evaluation on test set
     print("\n--- Step 5: Evaluating on test set ---")
-    test_info = get_test_week_info(week_info, split_indices)
-
     test_scores, _ = scorer.compute_scores(model, dataloaders["test"], device)
     predictions = scorer.predict(test_scores)
-
-    print(f"\n{'Week':<10} {'Score':>12} {'Predicted':>10} {'Actual':>12} {'Match':>6}")
-    print("-" * 55)
-
-    for score, pred, week in zip(test_scores, predictions, test_info):
-        if week.get("is_edge_case"):
-            continue
-        pred_str = "ANOMALY" if pred else "normal"
-        actual_str = "ANOMALY" if week["is_anomaly"] else "normal"
-        match = "Y" if pred == week["is_anomaly"] else "N"
-        print(f"{week['year_week']:<12} {score:>12.2f} {pred_str:>10} {actual_str:>12} {match:>6}")
-
-    scored = [(p, w) for p, w in zip(predictions, test_info) if not w.get("is_edge_case")]
-    tp = sum(1 for p, w in scored if p and w["is_anomaly"])
-    fp = sum(1 for p, w in scored if p and not w["is_anomaly"])
-    fn = sum(1 for p, w in scored if not p and w["is_anomaly"])
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-    print(f"\nPrecision: {precision:.2%}  Recall: {recall:.2%}  F1: {f1:.2%}")
+    n_flagged = predictions.sum()
+    print(f"Flagged {n_flagged}/{len(predictions)} patients as anomalous")
 
     # Step 6: Save artifacts
     print("\n--- Step 6: Saving artifacts ---")

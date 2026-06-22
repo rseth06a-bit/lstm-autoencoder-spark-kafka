@@ -111,16 +111,16 @@ class AnomalyScorer:
                     self.cov_inv_point = np.linalg.pinv(self.cov_point)
                 logger.info(f"Fitted point-level scorer (multivariate, m={num_features})")
 
-            # Also fit window-level for backward compatibility
-            all_errors_squeezed = all_errors.squeeze(-1)
-            self.mu = np.mean(all_errors_squeezed, axis=0)
-            errors_centered = all_errors_squeezed - self.mu
-            self.cov = np.cov(errors_centered, rowvar=False)
-            self.cov += self.config.regularization * np.eye(seq_len)
-            try:
-                self.cov_inv = np.linalg.inv(self.cov)
-            except np.linalg.LinAlgError:
-                self.cov_inv = np.linalg.pinv(self.cov)
+            # # Also fit window-level for backward compatibility
+            # all_errors_squeezed = all_errors.squeeze(-1)
+            # self.mu = np.mean(all_errors_squeezed, axis=0)
+            # errors_centered = all_errors_squeezed - self.mu
+            # self.cov = np.cov(errors_centered, rowvar=False)
+            # self.cov += self.config.regularization * np.eye(seq_len)
+            # try:
+            #     self.cov_inv = np.linalg.inv(self.cov)
+            # except np.linalg.LinAlgError:
+            #     self.cov_inv = np.linalg.pinv(self.cov)
 
         else:
             all_errors = all_errors.squeeze(-1)
@@ -169,9 +169,11 @@ class AnomalyScorer:
             for batch in data_loader:
                 x = batch.to(device)
                 x_reconstructed = model(x)
-                errors = torch.abs(x - x_reconstructed).cpu().numpy().squeeze(-1)
+                errors = torch.abs(x - x_reconstructed).cpu().numpy()
                 for error in errors:
-                    score = self._mahalanobis_distance(error)
+                    diff = error - self.mu_point
+                    point_scores = np.einsum('ij,jk,ik->i', diff, self.cov_inv_point, diff)
+                    score = float(np.sum(point_scores))
                     all_scores.append(score)
                 all_errors.append(errors)
 
