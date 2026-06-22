@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     """Configuration for the LSTM Encoder-Decoder model."""
-    input_dim: int = 1          # Number of features (1 for univariate)
+    input_dim: int = 5          # Number of features (5 vitals)
     hidden_dim: int = 64        # LSTM hidden state dimension
     num_layers: int = 1         # Number of stacked LSTM layers
     dropout: float = 0.2        # Dropout rate (applied if num_layers > 1)
