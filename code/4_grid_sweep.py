@@ -35,8 +35,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model import create_model
 from src.scorer import AnomalyScorer, ScorerConfig
-from src.preprocess import PreprocessorConfig, preprocess_pipeline, get_test_week_info
 from src.training import TrainingConfig, save_training_artifacts, train_model
+from src.preprocess import PreprocessorConfig, preprocess_pipeline, VITAL_COLUMNS, WINDOW_SIZE
+import pandas as pd
+
+DEFAULT_OUTCOMES_PATH = str(PROJECT_ROOT / "Outcomes-a.txt")
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +49,6 @@ DEFAULT_DATA_PATH = str(PROJECT_ROOT / "data" / "nyc_taxi.csv")
 # ---------------------------------------------------------------------------
 # Configs & result dataclasses
 # ---------------------------------------------------------------------------
-
-@dataclass
-class SplitConfig:
-    """Configuration for a single split experiment."""
-    train_weeks: int
-    val_weeks: int
-    threshold_weeks: int
-
-    @property
-    def total_dev_weeks(self) -> int:
-        return self.train_weeks + self.val_weeks + self.threshold_weeks
-
 
 @dataclass
 class HyperparamConfig:
@@ -129,38 +120,24 @@ def compute_f_beta(precision: float, recall: float, beta: float = 0.1) -> float:
     b2 = beta ** 2
     return (1 + b2) * precision * recall / (b2 * precision + recall)
 
+def get_test_actuals(test_patient_ids: list, outcomes_path: str) -> np.ndarray:
+    """Look up ground-truth In-hospital_death for each test patient."""
+    outcomes = pd.read_csv(outcomes_path)
+    outcomes["RecordID"] = outcomes["RecordID"].astype(str)
+    lookup = outcomes.set_index("RecordID")["In-hospital_death"]
+    return np.array([bool(lookup.loc[pid]) for pid in test_patient_ids])
 
-def compute_metrics(
-    predictions: np.ndarray,
-    actuals: np.ndarray,
-    skip_mask: Optional[np.ndarray] = None,
-    beta: float = 0.1,
-) -> Dict[str, float]:
-    """Weeks where skip_mask=True are excluded from precision/recall/F1."""
-    if skip_mask is None:
-        skip_mask = np.zeros_like(predictions, dtype=bool)
-    scored = ~skip_mask
-    p = predictions[scored]
-    a = actuals[scored]
-
-    tp = np.sum(p & a)
-    fp = np.sum(p & ~a)
-    fn = np.sum(~p & a)
-    tn = np.sum(~p & ~a)
-
+def compute_metrics(predictions: np.ndarray, actuals: np.ndarray, beta: float = 0.1) -> Dict[str, float]:
+    tp = np.sum(predictions & actuals)
+    fp = np.sum(predictions & ~actuals)
+    fn = np.sum(~predictions & actuals)
+    tn = np.sum(~predictions & ~actuals)
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     f_beta = compute_f_beta(precision, recall, beta)
-    accuracy = (tp + tn) / len(p) if len(p) > 0 else 0.0
-
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "f_beta_score": f_beta,
-    }
+    accuracy = (tp + tn) / len(predictions) if len(predictions) > 0 else 0.0
+    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1_score": f1, "f_beta_score": f_beta}
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +146,10 @@ def compute_metrics(
 
 def train_full(
     data_path: str,
+    outcomes_path: str,
     device: torch.device,
-    train_weeks: int,
-    val_weeks: int,
-    threshold_weeks: int,
+    train_fraction: float,
+    val_fraction: float,
     hidden_dim: int = 64,
     num_layers: int = 1,
     dropout: float = 0.2,
@@ -192,43 +169,46 @@ def train_full(
     (which persists the artifacts).
     """
     preprocess_config = PreprocessorConfig(
-        train_weeks=train_weeks,
-        val_weeks=val_weeks,
-        threshold_weeks=threshold_weeks,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
     )
-    dataloaders, _, scaler, week_info, split_indices = preprocess_pipeline(
+    dataloaders, _, scaler, patient_ids, split_ids = preprocess_pipeline(
         data_path, config=preprocess_config, batch_size=batch_size,
     )
-    for split in ("train", "val", "threshold_val", "test"):
+    for split in ("train", "val", "test"):
         if dataloaders[split] is None or len(dataloaders[split].dataset) == 0:
             return None
-
-    model = create_model(hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
+    model = create_model(
+        input_dim=len(VITAL_COLUMNS),
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+        sequence_length=WINDOW_SIZE,
+    )
     model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
 
     tc = TrainingConfig(epochs=epochs, learning_rate=learning_rate, patience=patience)
-    model, history = train_model(
-        model, dataloaders["train"], dataloaders["val"], device, tc
-    )
+    model, history = train_model(model, dataloaders["train"], dataloaders["val"], device, tc)
 
     scorer = AnomalyScorer(config=ScorerConfig(threshold_percentile=threshold_percentile))
     scorer.fit(model, dataloaders["val"], device)
-    threshold_scores, _ = scorer.compute_scores(model, dataloaders["threshold_val"], device)
-    scorer.set_threshold(threshold_scores)
+    scorer.set_threshold(scorer.compute_scores(model, dataloaders["val"], device)[0])
 
     test_scores, _ = scorer.compute_scores(model, dataloaders["test"], device)
     predictions = scorer.predict(test_scores)
+    flagged_ids = [pid for pid, p in zip(split_ids["test"], predictions) if p]
+    print(f"  [debug] flagged patient IDs: {flagged_ids}")
+    print(f"  [debug] threshold={scorer.threshold:.2f}  test_scores=[{test_scores.min():.2f}, {test_scores.max():.2f}]  n_flagged={predictions.sum()}")
 
-    test_info = get_test_week_info(week_info, split_indices)
-    actuals = np.array([w["is_anomaly"] for w in test_info])
-    skip_mask = np.array([w.get("is_edge_case", False) for w in test_info])
-    metrics = compute_metrics(predictions, actuals, skip_mask, beta)
+
+    test_patient_ids = split_ids["test"]
+    actuals = get_test_actuals(test_patient_ids, outcomes_path)
+    metrics = compute_metrics(predictions, actuals, beta)
 
     config_dict = {
-        "train_weeks": train_weeks,
-        "val_weeks": val_weeks,
-        "threshold_weeks": threshold_weeks,
+        "train_fraction": train_fraction,
+        "val_fraction": val_fraction,
         "hidden_dim": hidden_dim,
         "num_layers": num_layers,
         "dropout": dropout,
@@ -237,28 +217,20 @@ def train_full(
     }
 
     return {
-        "model": model,
-        "scaler": scaler,
-        "scorer": scorer,
-        "history": history,
-        "preprocess_config": preprocess_config,
-        "metrics": metrics,
-        "config_dict": config_dict,
-        "total_params": total_params,
-        "threshold": scorer.threshold,
-        "test_info": test_info,
-        "predictions": predictions,
-        "test_scores": test_scores,
-        "skip_mask": skip_mask,
+         "model": model, "scaler": scaler, "scorer": scorer, "history": history,
+        "preprocess_config": preprocess_config, "metrics": metrics,
+        "config_dict": config_dict, "total_params": total_params,
+        "threshold": scorer.threshold, "test_patient_ids": test_patient_ids,
+        "predictions": predictions, "test_scores": test_scores,
     }
 
 
 def train_and_evaluate(
     data_path: str,
+    outcomes_path: str,
     device: torch.device,
-    train_weeks: int,
-    val_weeks: int,
-    threshold_weeks: int,
+    train_fraction: float,
+    val_fraction: float,
     hidden_dim: int = 64,
     num_layers: int = 1,
     dropout: float = 0.2,
@@ -269,11 +241,10 @@ def train_and_evaluate(
     patience: int = 10,
     beta: float = 0.1,
 ) -> Optional[ExperimentResult]:
-    """Sweep-loop wrapper: runs train_full and packages metrics into an ExperimentResult."""
     try:
         run = train_full(
-            data_path=data_path, device=device,
-            train_weeks=train_weeks, val_weeks=val_weeks, threshold_weeks=threshold_weeks,
+            data_path=data_path, outcomes_path=outcomes_path, device=device,
+            train_fraction=train_fraction, val_fraction=val_fraction,
             hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout,
             learning_rate=learning_rate, threshold_percentile=threshold_percentile,
             batch_size=batch_size, epochs=epochs, patience=patience, beta=beta,
@@ -327,10 +298,10 @@ def retrain_best_and_save(
     set_seed(42)
     run = train_full(
         data_path=args.data_path,
+        outcomes_path=args.outcomes_path,
         device=device,
-        train_weeks=cfg["train_weeks"],
-        val_weeks=cfg["val_weeks"],
-        threshold_weeks=cfg["threshold_weeks"],
+        train_fraction=cfg["train_fraction"],
+        val_fraction=cfg["val_fraction"],
         hidden_dim=cfg["hidden_dim"],
         num_layers=cfg["num_layers"],
         dropout=cfg["dropout"],
@@ -367,58 +338,6 @@ def retrain_best_and_save(
 
 
 # ---------------------------------------------------------------------------
-# Split optimization
-# ---------------------------------------------------------------------------
-
-def generate_split_configs(
-    total_dev_weeks: int, min_train: int = 4, min_val: int = 2, min_threshold: int = 1,
-) -> List[SplitConfig]:
-    configs = []
-    for tw in range(min_train, total_dev_weeks - min_val - min_threshold + 1):
-        remaining = total_dev_weeks - tw
-        for vw in range(min_val, remaining - min_threshold + 1):
-            thw = remaining - vw
-            if thw >= min_threshold:
-                configs.append(SplitConfig(train_weeks=tw, val_weeks=vw, threshold_weeks=thw))
-    return configs
-
-
-def run_split_optimization(args) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    configs = generate_split_configs(
-        args.total_dev_weeks, args.min_train, args.min_val, args.min_threshold,
-    )
-    print(f"\nDevice: {device}")
-    print(f"Testing {len(configs)} split configurations "
-          f"(dev_weeks={args.total_dev_weeks}, min_train={args.min_train}, "
-          f"min_val={args.min_val}, min_thresh={args.min_threshold})")
-
-    results: List[ExperimentResult] = []
-    for i, cfg in enumerate(configs):
-        set_seed(42)
-        print(f"\n[{i+1}/{len(configs)}] train={cfg.train_weeks}, "
-              f"val={cfg.val_weeks}, threshold={cfg.threshold_weeks}...", end="", flush=True)
-        r = train_and_evaluate(
-            data_path=args.data_path, device=device,
-            train_weeks=cfg.train_weeks, val_weeks=cfg.val_weeks,
-            threshold_weeks=cfg.threshold_weeks,
-            hidden_dim=args.hidden_dim, epochs=args.epochs, patience=args.patience,
-            beta=args.beta,
-        )
-        if r is not None:
-            results.append(r)
-            print(f"  F1={r.f1_score:.2%}  Prec={r.precision:.2%}  Rec={r.recall:.2%}")
-
-    _print_results(results, sort_by="f1_score", title="SPLIT OPTIMIZATION RESULTS")
-    if args.output:
-        _save_results(results, args.output, len(configs), "f1_score", args.beta)
-
-    if results and not args.no_retrain_best:
-        best = max(results, key=lambda r: r.f1_score)
-        retrain_best_and_save(best, args, device)
-
-
-# ---------------------------------------------------------------------------
 # Hyperparameter optimization
 # ---------------------------------------------------------------------------
 
@@ -433,25 +352,25 @@ def _focused_configs() -> List[HyperparamConfig]:
     well-tuned config that hits 100% F1 on the scored test weeks.
     """
     return [
-        # Baseline-ish (matches 1_train_model.py defaults)
-        HyperparamConfig(32, 1, 0.2, 1e-3, 99.99),
-        HyperparamConfig(32, 1, 0.0, 1e-3, 99.99),
+        # Baseline-ish
+        HyperparamConfig(32, 1, 0.2, 1e-3, 90.0),
+        HyperparamConfig(32, 1, 0.0, 1e-3, 90.0),
         # Wider models
-        HyperparamConfig(40, 1, 0.2, 1e-3, 99.99),
-        HyperparamConfig(40, 1, 0.2, 5e-4, 99.99),
-        HyperparamConfig(64, 1, 0.0, 1e-3, 99.99),
-        HyperparamConfig(64, 1, 0.1, 1e-3, 99.99),
-        HyperparamConfig(64, 1, 0.2, 1e-3, 99.99),
-        # The prebuilt-equivalent winner
-        HyperparamConfig(64, 1, 0.2, 5e-4, 99.99),
-        # Variations around the winner
-        HyperparamConfig(64, 1, 0.3, 5e-4, 99.99),
-        HyperparamConfig(64, 2, 0.2, 5e-4, 99.99),
-        HyperparamConfig(128, 1, 0.2, 5e-4, 99.99),
-        HyperparamConfig(128, 1, 0.3, 5e-4, 99.99),
-        # Threshold sensitivity at the winning architecture
-        HyperparamConfig(64, 1, 0.2, 5e-4, 99.0),
-        HyperparamConfig(64, 1, 0.2, 5e-4, 99.9),
+        HyperparamConfig(40, 1, 0.2, 1e-3, 90.0),
+        HyperparamConfig(40, 1, 0.2, 5e-4, 90.0),
+        HyperparamConfig(64, 1, 0.0, 1e-3, 90.0),
+        HyperparamConfig(64, 1, 0.1, 1e-3, 90.0),
+        HyperparamConfig(64, 1, 0.2, 1e-3, 90.0),
+        HyperparamConfig(64, 1, 0.2, 5e-4, 90.0),
+        # Variations
+        HyperparamConfig(64, 1, 0.3, 5e-4, 90.0),
+        HyperparamConfig(64, 2, 0.2, 5e-4, 90.0),
+        HyperparamConfig(128, 1, 0.2, 5e-4, 90.0),
+        HyperparamConfig(128, 1, 0.3, 5e-4, 90.0),
+        # Threshold sensitivity sweep at the leading architecture
+        HyperparamConfig(64, 1, 0.2, 5e-4, 80.0),
+        HyperparamConfig(64, 1, 0.2, 5e-4, 85.0),
+        HyperparamConfig(64, 1, 0.2, 5e-4, 95.0),
     ]
 
 
@@ -492,7 +411,7 @@ def run_hyperparams_optimization(args) -> None:
         configs = _focused_configs()
 
     print(f"\nDevice: {device}")
-    print(f"Split: train={args.train_weeks}, val={args.val_weeks}, threshold={args.threshold_weeks}")
+    print(f"Split: train_fraction={args.train_fraction}, val_fraction={args.val_fraction}")
     print(f"Search: {args.search} ({len(configs)} configurations)")
 
     results: List[ExperimentResult] = []
@@ -506,9 +425,8 @@ def run_hyperparams_optimization(args) -> None:
               f"thresh={cfg.threshold_percentile}%...", end="", flush=True)
 
         r = train_and_evaluate(
-            data_path=args.data_path, device=device,
-            train_weeks=args.train_weeks, val_weeks=args.val_weeks,
-            threshold_weeks=args.threshold_weeks,
+            data_path=args.data_path, outcomes_path=args.outcomes_path, device=device,
+            train_fraction=args.train_fraction, val_fraction=args.val_fraction,
             hidden_dim=cfg.hidden_dim, num_layers=cfg.num_layers,
             dropout=cfg.dropout, learning_rate=cfg.learning_rate,
             threshold_percentile=cfg.threshold_percentile,
@@ -543,17 +461,17 @@ def _print_results(results: List[ExperimentResult], sort_by: str = "f1_score",
         return
     sorted_r = sorted(results, key=lambda r: getattr(r, sort_by), reverse=True)
     print(f"\n{'=' * 110}\n{title}\n{'=' * 110}")
-    print(f"{'Train':>6} {'Val':>4} {'Thr':>4} {'Hidden':>7} {'Lay':>4} "
-          f"{'Drop':>5} {'LR':>9} {'Thr%':>6} {'Acc':>7} {'Prec':>7} "
-          f"{'Rec':>7} {'F1':>7} {'Fb':>7}")
+    print(f"{'TrainF':>7} {'ValF':>6} {'Hidden':>7} {'Lay':>4} "
+      f"{'Drop':>5} {'LR':>9} {'Thr%':>6} {'Acc':>7} {'Prec':>7} "
+      f"{'Rec':>7} {'F1':>7} {'Fb':>7}")
     print("-" * 110)
     for r in sorted_r[:20]:
         c = r.config_dict
-        print(f"{c['train_weeks']:>6} {c['val_weeks']:>4} {c['threshold_weeks']:>4} "
-              f"{c['hidden_dim']:>7} {c['num_layers']:>4} {c['dropout']:>5.2f} "
-              f"{c['learning_rate']:>9.1e} {c['threshold_percentile']:>6.1f} "
-              f"{r.accuracy:>7.2%} {r.precision:>7.2%} {r.recall:>7.2%} "
-              f"{r.f1_score:>7.2%} {r.f_beta_score:>7.2%}")
+        print(f"{c['train_fraction']:>7.2f} {c['val_fraction']:>6.2f} "
+            f"{c['hidden_dim']:>7} {c['num_layers']:>4} {c['dropout']:>5.2f} "
+            f"{c['learning_rate']:>9.1e} {c['threshold_percentile']:>6.1f} "
+            f"{r.accuracy:>7.2%} {r.precision:>7.2%} {r.recall:>7.2%} "
+            f"{r.f1_score:>7.2%} {r.f_beta_score:>7.2%}")
     best = sorted_r[0]
     print(f"\nBEST (by {sort_by}): {best.config_dict}")
     print(f"  F1={best.f1_score:.2%}  Fb={best.f_beta_score:.2%}  "
@@ -590,9 +508,7 @@ def main() -> None:
                     "After the sweep, retrains the winning configuration and "
                     "saves it to --best-dir so it can be evaluated directly."
     )
-    parser.add_argument("--mode", choices=["split", "hyperparams"], default="hyperparams",
-                        help="Sweep mode (default: hyperparams).")
-    parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)
+    parser.add_argument("--data-path", type=str, default=str(PROJECT_ROOT / "set-a"))
     parser.add_argument("--input-dir", type=str,
                         default=str(PROJECT_ROOT / "models" / "initial"),
                         help="Baseline run produced by 1_train_model.py. "
@@ -610,18 +526,10 @@ def main() -> None:
                         help="Beta for F-beta score (paper uses 0.1)")
     parser.add_argument("--verbose", action="store_true")
 
-    # Split-specific
-    parser.add_argument("--total-dev-weeks", type=int, default=14)
-    parser.add_argument("--min-train", type=int, default=4)
-    parser.add_argument("--min-val", type=int, default=2)
-    parser.add_argument("--min-threshold", type=int, default=1)
-    parser.add_argument("--hidden-dim", type=int, default=64,
-                        help="Fixed hidden dim (split mode)")
-
     # Hyperparams-specific
-    parser.add_argument("--train-weeks", type=int, default=8)
-    parser.add_argument("--val-weeks", type=int, default=2)
-    parser.add_argument("--threshold-weeks", type=int, default=4)
+    parser.add_argument("--train-fraction", type=float, default=0.7)
+    parser.add_argument("--val-fraction", type=float, default=0.15)
+    parser.add_argument("--outcomes-path", type=str, default=DEFAULT_OUTCOMES_PATH)
     parser.add_argument("--search", choices=["grid", "random", "focused"], default="focused")
     parser.add_argument("--n-configs", type=int, default=30,
                         help="Number of random configs (random search only)")
@@ -634,7 +542,6 @@ def main() -> None:
     logging.basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(message)s")
 
     print("\n" + "=" * 60)
-    print(f"GRID SWEEP  --  mode={args.mode}")
     print("=" * 60)
     baseline_dir = Path(args.input_dir)
     if baseline_dir.exists():
@@ -645,10 +552,7 @@ def main() -> None:
     print(f"Models in models/lstm_model.pt etc are NEVER touched.")
     print("=" * 60)
 
-    if args.mode == "split":
-        run_split_optimization(args)
-    else:
-        run_hyperparams_optimization(args)
+    run_hyperparams_optimization(args)
 
     print("\n" + "=" * 60)
     print("GRID SWEEP COMPLETE")
