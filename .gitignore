@@ -227,3 +227,5 @@ data/creditcard.csv
 models/initial/
 models/best/set-a/
 Outcomes-a.txt
+set-a/
+Outcomes-a.txt
