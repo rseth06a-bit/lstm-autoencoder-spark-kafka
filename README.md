@@ -160,7 +160,7 @@ One patient (record ID `137305`) is flagged as anomalous in **every single confi
 
 The most likely explanation is a known weakness of the Mahalanobis distance approach with a low validation sample size: the 5x5 covariance matrix is fit on a relatively small pooled-error sample, and any patient whose error vector falls in a low-density region of that covariance estimate can produce an extreme, unstable score that has more to do with covariance estimation noise than genuine clinical anomaly. 
 
-### Honest takeaway
+### Takeaway
 
 The reconstruction-error-based approach, applied as-is to this dataset, does not reliably separate ICU survivors from in-hospital deaths. It finds a weak, easily-lost signal at a fairly narrow part of the threshold range, and produces a substantial number of false positives even at its best configuration (2 true positives out of 9 flags).
 
