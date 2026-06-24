@@ -61,7 +61,7 @@ lstm-autoencoder-spark-kafka/
 
 **Note:** `code/2_evaluate_model.py` was not adapted for the ICU vitals pipeline and still references the original taxi-specific data loading (`get_test_week_info`). Running it as-is will fail. Evaluation in this fork happens inline through `code/4_grid_sweep.py`, which trains, scores, and reports precision/recall/F1 against real patient outcomes for every configuration tested.
 
-The scripts under `code/` are the **first-class** path: they reproduce the model end-to-end and are what you should run if you're trying to learn how training and evaluation work, or to adapt this to your own data. The notebooks under `notebooks/` are interactive **supporting material** -- they explain *why* the architecture is shaped the way it is, what the data looks like, and how the scoring methodology was chosen. 
+The scripts under `code/` are the **first-class** path: they reproduce the model end-to-end and are what you should run if you're trying to learn how training and evaluation work, or to adapt this to your own data. The notebooks under `notebooks/` are interactive **supporting material**. They explain *why* the architecture is shaped the way it is, what the data looks like, and how the scoring methodology was chosen. 
 
 ## Prerequisites
 
@@ -72,7 +72,7 @@ The scripts under `code/` are the **first-class** path: they reproduce the model
 ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-- **Docker** and **Docker Compose** (for the streaming demo only -- not required for the ICU training/sweep pipeline)
+- **Docker** and **Docker Compose** (for the streaming demo only, not required for the ICU training/sweep pipeline)
 
 ## Going through the code
 
@@ -86,7 +86,7 @@ uv sync
 
 ### 2. Get the dataset (not included in this repo)
 
-This fork uses the [PhysioNet/CinC 2012 Challenge dataset](https://physionet.org/content/challenge-2012/1.0.0/) ("Predicting Mortality of ICU Patients"). It is **not included in this repository** -- PhysioNet's data use agreement prohibits redistribution. Download it yourself:
+This fork uses the [PhysioNet/CinC 2012 Challenge dataset](https://physionet.org/content/challenge-2012/1.0.0/) ("Predicting Mortality of ICU Patients"). It is **not included in this repository**, since PhysioNet's data use agreement prohibits redistribution. It can be downloaded as shown:
 
 ```bash
 wget https://archive.physionet.org/pn3/challenge/2012/set-a.tar.gz
@@ -94,7 +94,7 @@ tar -xzf set-a.tar.gz
 wget https://archive.physionet.org/pn3/challenge/2012/Outcomes-a.txt
 ```
 
-Place the extracted `set-a/` directory and `Outcomes-a.txt` in the project root. Both are gitignored. This dataset is open-access (no PhysioNet credentialing required). Downloads from PhysioNet can be slow (~0.5 MB/s) -- this is normal, not a broken link.
+Place the extracted `set-a/` directory and `Outcomes-a.txt` in the project root. Both are gitignored. This dataset is open-access (no PhysioNet credentialing required). 
 
 The set contains ~4000 ICU patients' first-48-hour vitals as individual `.txt` files, and `Outcomes-a.txt` provides ground-truth in-hospital mortality and severity scores per patient.
 
@@ -128,11 +128,6 @@ The detector treats each ICU patient's first 48 hours as a single sample: 48 tim
 
 A single error vector `e` (one timestep, one patient, 5 features) is scored with the Mahalanobis distance and a patient's overall anomaly score is the sum of these point-level scores across all 48 timesteps in their window. A patient is flagged as anomalous when this summed score exceeds a threshold set at a chosen percentile of validation scores.
 
-This differs from the original taxi pipeline in two ways:
-
-1. **Point-level, not window-level, error distribution.** The original fit `mu`/`Sigma` over the full 336-step window (treating each week's entire error trajectory as one high-dimensional sample). This fork pools errors across all timesteps and patients, fitting a much lower-dimensional (5x5 instead of 336x336) covariance matrix -- a more stable estimate given the smaller per-patient sample size (48 steps vs. 336).
-2. **Ground-truth label is mortality, not a labeled calendar event.** The original validated detections against 5 hand-labeled anomalous weeks (holidays, weather events). This fork validates against real `In-hospital_death` outcomes from `Outcomes-a.txt` -- a much harder and more clinically meaningful target, since "unusual vitals" and "died in-hospital" are related but distinct concepts.
-
 This is implemented in `src/scorer.py` (`AnomalyScorer.compute_scores`, point-level mode) and reproduced end-to-end by `code/1_train_model.py` and `code/4_grid_sweep.py`.
 
 ## Results
@@ -149,27 +144,25 @@ The best configuration found via grid sweep (`hidden_dim=64, num_layers=1, dropo
 | Patients flagged | 9 |
 | True positives | 2 of 9 actual deaths |
 
-This is a real, non-trivial result -- but a modest one, and it's worth being direct about what it does and doesn't show.
-
 ### Why these numbers, and what they mean
 
-Unlike the original taxi pipeline, where the 5 labeled anomalies are visually obvious deviations from a clean recurring pattern, ICU vitals are noisy, irregular, and "unusual readings" don't map cleanly onto "this patient will die." Across every hyperparameter configuration tested in the sweep, performance is highly sensitive to the anomaly threshold:
+ICU vitals are noisy, irregular, and "unusual readings" don't map cleanly onto "this patient will die." Across every hyperparameter configuration tested in the sweep, performance is highly sensitive to the anomaly threshold:
 
 - At threshold percentiles of 85 and above, the model often flags **zero** patients and scores 0% across all metrics.
 - At percentile 90, the best configurations found genuine signal: 22.22% F1.
 - At lower percentiles (80), more patients get flagged (recall goes up slightly) but precision drops further, since the net is cast wider without much additional true signal.
 
-This narrow window where the model produces any signal at all suggests the separation between "anomalous" and "normal" patients in this score space is weak -- real, but easily overwhelmed by noise outside a fairly specific threshold range.
+This narrow window where the model produces any signal at all suggests the separation between "anomalous" and "normal" patients in this score space is weak. It's a real separation, but it's easily overwhelmed by noise outside a fairly specific threshold range.
 
 ### A known artifact: patient 137305
 
-One patient (record ID `137305`) is flagged as anomalous in **every single configuration tested**, regardless of architecture or threshold, with anomaly scores in the hundreds of thousands to millions -- multiple orders of magnitude above the next-highest score in the test set. This patient survived their ICU stay. Manual inspection of their raw vitals file showed no obvious data corruption or missing-data artifacts.
+One patient (record ID `137305`) is flagged as anomalous in **every single configuration tested**, regardless of architecture or threshold, with anomaly scores in the hundreds of thousands to millions. This patient survived their ICU stay. Manual inspection of their raw vitals file showed no obvious data corruption or missing-data artifacts.
 
-The most likely explanation is a known weakness of the Mahalanobis distance approach with a low validation sample size: the 5x5 covariance matrix is fit on a relatively small pooled-error sample, and any patient whose error vector falls in a low-density region of that covariance estimate can produce an extreme, unstable score that has more to do with covariance estimation noise than genuine clinical anomaly. This is a real limitation of applying this scoring method to a dataset with far fewer samples than the original taxi weekly windows, not a bug in the implementation.
+The most likely explanation is a known weakness of the Mahalanobis distance approach with a low validation sample size: the 5x5 covariance matrix is fit on a relatively small pooled-error sample, and any patient whose error vector falls in a low-density region of that covariance estimate can produce an extreme, unstable score that has more to do with covariance estimation noise than genuine clinical anomaly. 
 
 ### Honest takeaway
 
-The reconstruction-error-based approach, applied as-is to this dataset, does not reliably separate ICU survivors from in-hospital deaths. It finds a weak, real, but easily-lost signal at a fairly narrow part of the threshold range, and produces a substantial number of false positives even at its best configuration (2 true positives out of 9 flags). This is a legitimate and informative finding for a portfolio piece: it shows the methodology working correctly end-to-end (data pipeline, training, scoring, evaluation against real-world ground truth) and demonstrates honest evaluation rather than only reporting favorable numbers.
+The reconstruction-error-based approach, applied as-is to this dataset, does not reliably separate ICU survivors from in-hospital deaths. It finds a weak, easily-lost signal at a fairly narrow part of the threshold range, and produces a substantial number of false positives even at its best configuration (2 true positives out of 9 flags).
 
 A natural follow-up (not implemented here) would be combining the reconstruction score with simple clinical severity features (e.g. SOFA score) rather than relying on vitals-only reconstruction error alone, or using a per-feature anomaly threshold instead of a single pooled-covariance score, given how heterogeneous ICU vitals patterns can be across different types of instability.
 
@@ -177,7 +170,7 @@ A natural follow-up (not implemented here) would be combining the reconstruction
 
 ## Out-of-scope: original streaming, Docker, and Striim integration
 
-Everything below this point is **carried over unmodified from the original repo**. None of it was adapted to the ICU vitals domain -- it still operates on the NYC taxi dataset and the original window-level, 336-step Mahalanobis scorer. It's included here for completeness (since the files are still present in this fork and the original README documented them), not as part of this fork's contribution.
+Everything below this point is **carried over unmodified from the original repo**. None of it was adapted to the ICU vitals domain, so it still operates on the NYC taxi dataset and the original window-level, 336-step Mahalanobis scorer. It's included here for completeness (since the files are still present in this fork and the original README documented them), not as part of this fork's contribution.
 
 ### Docker demo with visual application
 
